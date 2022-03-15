@@ -1,0 +1,97 @@
+import json
+import time
+import unittest
+from math import modf
+import numpy as np
+import requests_cache
+from pytz import timezone
+from skyfield import api, almanac
+
+ts = api.load.timescale()
+load = api.Loader('/var/data')
+s = requests_cache.CachedSession('tzapicache')
+e = load('de430t.bsp')
+
+tzapikey='SEKRET'
+
+
+def equilux(lat, lon, tzstr, year=2022, years=1):
+    ''' find the dates of the equinoxes and equiluxes
+    lat: latitude of observation
+    lon: longitude of observation
+    year: duh
+    tzstr: timezone as in America/New_York
+    '''
+    tz = timezone(tzstr)
+
+    t0 = ts.utc(year, 1, 1)
+    t1 = ts.utc(year, 12, 31)
+    t, y = almanac.find_discrete(t0, t1, almanac.seasons(e))
+
+    results = {}
+    for yi, ti in zip(y, t): # iterate over solstices and equinoxes
+        if 'Equinox' not in almanac.SEASON_EVENTS[yi]:
+            continue  # we only care about equinoxes here
+        dt = ti.utc_datetime()
+        results[almanac.SEASON_EVENTS[yi]], _ = ti.astimezone_and_leap_second(tz)
+        bluffton = api.Topos(lat, lon)
+        t0 = ts.utc(dt.year, dt.month, dt.day - 7)
+        t1 = ts.utc(dt.year, dt.month, dt.day + 7)
+        # find sunrise and set time over 2 week span centered on equinox
+        t2, y2 = almanac.find_discrete(t0, t1, almanac.sunrise_sunset(e, bluffton))
+        prev = None
+        dates = []
+        delta = []
+        sunlight = []
+        for t2i, y2i in zip(t2, y2):
+            dt2, _ = t2i.astimezone_and_leap_second(tz)
+            hrs = dt2.hour + dt2.minute / 60.0 + dt2.second / 3600.0
+            if y2i:  # rise
+                prev = hrs
+            elif prev is not None:  # set
+                dates.append(dt2)
+                delta.append(abs(hrs - prev - 12.0))
+                sunlight.append(hrs - prev)
+        idx = delta.index(min(delta))
+        results[almanac.SEASON_EVENTS[yi]], _ = ti.astimezone_and_leap_second(tz)
+
+        hrs = int(sunlight[idx])
+        rem = (sunlight[idx] - hrs) * 60.0
+        mins = int(rem)
+        secs = (rem - mins) * 60.0
+
+        # record equinox and equilux dates and durations
+        results[almanac.SEASON_EVENTS[yi].replace('nox', 'lux')] = dates[idx]
+        results[f"{almanac.SEASON_EVENTS[yi].replace('nox', 'lux')} time"] = f'{hrs} hrs {mins} min {secs:.1f} sec'
+        results[f"{almanac.SEASON_EVENTS[yi].replace('nox', 'lux')} hours"] = sunlight[idx]
+
+    return results
+
+def eqmap():
+    '''
+    generate a map of text integers at degree intesections with date of vernal equilux
+    '''
+    foo = {}
+    from tqdm import tqdm
+    for lat in np.arange(50,24,-1):
+        print(lat, end=' ')
+        for lng in np.arange(-125,-64,1):
+            url = f"http://api.timezonedb.com/v2.1/get-time-zone?key={tzapikey}&format=json&by=position&lat={lat:.1f}&lng={lng:.1f}"
+            r = s.get(url)
+            tzdata = r.json()
+            if not r.from_cache:
+                time.sleep(1)  # throttle API calls
+            if len(tzdata['zoneName']):
+                data = equilux(float(lat), float(lng), tzdata['zoneName'], year=2023)
+                foo[f"{lat:5.1f},{lng:5.1f}"] = data['Vernal Equilux'].strftime('%d')
+                print(f"{data['Vernal Equilux'].strftime('%d')} ", end='', flush=True)
+            else:
+                print('  ', end=' ', flush=True)
+        print()
+        with open('equil.json', 'w', encoding='utf-8') as f:
+            json.dump(foo, f, indent=4)
+
+
+
+if __name__ == '__main__':
+    eqmap()
